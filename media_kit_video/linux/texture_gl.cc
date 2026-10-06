@@ -63,13 +63,16 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
   TextureGL* self = TEXTURE_GL(texture);
   VideoOutput* video_output = self->video_output;
 
+  // Runs on Flutter's raster thread with Flutter's GL context current.
+  // Create the mpv render context on the very first populate, before any
+  // video plays: with vo=libmpv, mpv only initializes video once a render
+  // context exists.
+  video_output_ensure_render_context(video_output);
+
   gint32 required_width = (guint32)video_output_get_width(video_output);
   gint32 required_height = (guint32)video_output_get_height(video_output);
 
   if (required_width > 0 && required_height > 0) {
-    // Runs on Flutter's raster thread with Flutter's GL context current.
-    // Creates the mpv render context on first use ("Plan D").
-    video_output_ensure_render_context(video_output);
     mpv_render_context* render_context =
         video_output_get_render_context(video_output);
 

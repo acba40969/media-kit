@@ -162,7 +162,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
     if (fl_texture_registrar_register_texture(
             texture_registrar, FL_TEXTURE(self->texture_gl))) {
       hardware_acceleration_supported = TRUE;
-      g_print("media_kit: VideoOutput: H/W rendering via Flutter's raster context (v5).\n");
+      g_print("media_kit: VideoOutput: H/W rendering via Flutter's raster context (v6).\n");
       // Kick the raster thread periodically until the render context exists
       // (populate -> ensure_render_context); afterwards mpv's own update
       // callback drives the texture and the poller removes itself.
