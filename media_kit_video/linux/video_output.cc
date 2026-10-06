@@ -15,8 +15,6 @@
 #include <gdk/gdkwayland.h>
 #include <gdk/gdkx.h>
 
-#include <string.h>
-
 struct _VideoOutput {
   GObject parent_instance;
   TextureGL* texture_gl;
@@ -35,7 +33,6 @@ struct _VideoOutput {
   gpointer texture_update_callback_context;
   FlTextureRegistrar* texture_registrar;
   gboolean destroyed;
-  guint poller_id; /* GLib source id of the render-context poller. */
 };
 
 G_DEFINE_TYPE(VideoOutput, video_output, G_TYPE_OBJECT)
@@ -43,10 +40,6 @@ G_DEFINE_TYPE(VideoOutput, video_output, G_TYPE_OBJECT)
 static void video_output_dispose(GObject* object) {
   VideoOutput* self = VIDEO_OUTPUT(object);
   self->destroyed = TRUE;
-  if (self->poller_id != 0) {
-    g_source_remove(self->poller_id);
-    self->poller_id = 0;
-  }
   
   // Make sure that no more callbacks are invoked from mpv.
   if (self->render_context) {
@@ -57,17 +50,36 @@ static void video_output_dispose(GObject* object) {
   if (self->texture_gl) {
     fl_texture_registrar_unregister_texture(self->texture_registrar,
                                             FL_TEXTURE(self->texture_gl));
-    // The render context is freed here (platform thread) without any GL
-    // context current; libmpv >= 0.30 allows calling this from any thread,
-    // and GL object deletions become no-ops via glvnd. GPU resources shared
-    // with Flutter's context are reclaimed when the process exits.
+    
+    // Save Flutter's current context before cleanup
+    EGLDisplay current_display = eglGetCurrentDisplay();
+    EGLContext flutter_context = eglGetCurrentContext();
+    EGLSurface flutter_draw_surface = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface flutter_read_surface = eglGetCurrentSurface(EGL_READ);
+    
+    // Free mpv_render_context with our own isolated EGL context
     if (self->render_context != NULL) {
-      mpv_render_context_set_update_callback(self->render_context, NULL, NULL);
+      if (self->egl_context != EGL_NO_CONTEXT) {
+        eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context);
+      }
       mpv_render_context_free(self->render_context);
       self->render_context = NULL;
+      
+      // Restore Flutter's context
+      if (flutter_context != EGL_NO_CONTEXT) {
+        eglMakeCurrent(current_display, flutter_draw_surface, flutter_read_surface, flutter_context);
+      } else if (self->egl_display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+      }
     }
+    
+    // Clean up EGL resources
+    if (self->egl_context != EGL_NO_CONTEXT) {
+      eglDestroyContext(self->egl_display, self->egl_context);
+      self->egl_context = EGL_NO_CONTEXT;
+    }
+    
     g_object_unref(self->texture_gl);
-    self->texture_gl = NULL;
   }
   // S/W
   if (self->texture_sw) {
@@ -98,7 +110,6 @@ static void video_output_init(VideoOutput* self) {
   self->pixel_buffer = NULL;
   self->handle = NULL;
   self->render_context = NULL;
-  self->poller_id = 0;
   self->width = 0;
   self->height = 0;
   self->configuration = VideoOutputConfiguration{};
@@ -109,21 +120,52 @@ static void video_output_init(VideoOutput* self) {
   g_mutex_init(&self->mutex);
 }
 
-static gboolean video_output_poll_texture(gpointer data) {
-  VideoOutput* self = VIDEO_OUTPUT(data);
-  if (self->destroyed) {
-    self->poller_id = 0;
-    return G_SOURCE_REMOVE;
+/* On X11 GTK creates its GL context through GLX, so the thread that builds a
+   VideoOutput has no current EGL context. Fall back to an EGL display made
+   from GDK's own native display, which Mesa shares with Flutter's renderer. */
+static EGLDisplay video_output_open_egl_display() {
+  /* epoxy refuses to dispatch EGL 1.5 entry points before a display exists,
+     so resolve the platform display call straight from libEGL. */
+  typedef EGLDisplay (*GetPlatformDisplayFn)(EGLenum, void*, const EGLint*);
+  typedef EGLDisplay (*GetPlatformDisplayExtFn)(EGLenum, void*, const EGLint*);
+  GetPlatformDisplayFn get_display =
+      (GetPlatformDisplayFn)eglGetProcAddress("eglGetPlatformDisplay");
+  if (get_display == NULL) {
+    get_display =
+        (GetPlatformDisplayExtFn)eglGetProcAddress("eglGetPlatformDisplayEXT");
   }
-  if (self->render_context != NULL) {
-    // mpv's update callback drives the texture now.
-    g_print("media_kit: VideoOutput: poller stopped (render context ready)\n");
-    self->poller_id = 0;
-    return G_SOURCE_REMOVE;
+  if (get_display == NULL) {
+    return EGL_NO_DISPLAY;
   }
-  fl_texture_registrar_mark_texture_frame_available(
-      self->texture_registrar, FL_TEXTURE(self->texture_gl));
-  return G_SOURCE_CONTINUE;
+  GdkDisplay* gdk_display = gdk_display_get_default();
+  EGLDisplay display = EGL_NO_DISPLAY;
+  if (GDK_IS_WAYLAND_DISPLAY(gdk_display)) {
+    display = get_display(0x31D8 /* EGL_PLATFORM_WAYLAND_KHR */,
+                          gdk_wayland_display_get_wl_display(gdk_display), NULL);
+  } else if (GDK_IS_X11_DISPLAY(gdk_display)) {
+    display = get_display(0x31D5 /* EGL_PLATFORM_X11_KHR */,
+                          gdk_x11_display_get_xdisplay(gdk_display), NULL);
+  }
+  if (display == EGL_NO_DISPLAY) {
+    return EGL_NO_DISPLAY;
+  }
+  EGLint major = 0, minor = 0;
+  if (!eglInitialize(display, &major, &minor)) {
+    return EGL_NO_DISPLAY;
+  }
+  return display;
+}
+
+static void video_output_restore_egl(EGLDisplay display,
+                                     EGLSurface draw,
+                                     EGLSurface read,
+                                     EGLContext context,
+                                     EGLDisplay own_display) {
+  if (context != EGL_NO_CONTEXT) {
+    eglMakeCurrent(display, draw, read, context);
+  } else if (own_display != EGL_NO_DISPLAY) {
+    eglMakeCurrent(own_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  }
 }
 
 VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
@@ -148,30 +190,129 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
   // mpv_set_option_string(self->handle, "video-timing-offset", "0");
   gboolean hardware_acceleration_supported = FALSE;
   if (self->configuration.enable_hardware_acceleration) {
-    // v4 ("Plan D"): no EGL calls here. video_output_new() runs on a thread
-    // where NVIDIA's EGL refuses eglMakeCurrent (every surface/API
-    // combination returns EGL_BAD_ACCESS). Instead, the mpv render context
-    // is created lazily in texture_gl_populate_texture(), which runs on
-    // Flutter's raster thread with Flutter's own GL context current, and
-    // mpv renders directly into Flutter's texture.
-    // The render context is created later (on the raster thread); force
-    // mpv to wait for it instead of falling back to a windowed VO.
-    mpv_set_option_string(self->handle, "vo", "libmpv");
-
-    self->texture_gl = texture_gl_new(self);
-
-    if (fl_texture_registrar_register_texture(
-            texture_registrar, FL_TEXTURE(self->texture_gl))) {
-      hardware_acceleration_supported = TRUE;
-      g_print("media_kit: VideoOutput: H/W rendering via Flutter's raster context (v7).\n");
-      // Kick the raster thread periodically until the render context exists
-      // (populate -> ensure_render_context); afterwards mpv's own update
-      // callback drives the texture and the poller removes itself.
-      self->poller_id = g_timeout_add(200, video_output_poll_texture, self);
+    // Get Flutter's current EGL display (DO NOT share context)
+    EGLDisplay flutter_display = eglGetCurrentDisplay();
+    EGLContext flutter_context = eglGetCurrentContext();
+    EGLSurface flutter_draw_surface = eglGetCurrentSurface(EGL_DRAW);
+    EGLSurface flutter_read_surface = eglGetCurrentSurface(EGL_READ);
+    
+    self->egl_display = EGL_NO_DISPLAY;
+    EGLConfig config = NULL;
+    if (flutter_display != EGL_NO_DISPLAY && flutter_context != EGL_NO_CONTEXT) {
+      self->egl_display = flutter_display;
     } else {
-      g_printerr("media_kit: VideoOutput: Failed to register texture.\n");
-      g_object_unref(self->texture_gl);
-      self->texture_gl = NULL;
+      g_print("media_kit: VideoOutput: No current EGL context, using GDK's display.\n");
+      self->egl_display = video_output_open_egl_display();
+    }
+
+    if (self->egl_display != EGL_NO_DISPLAY) {
+      // Bind OpenGL ES API (Flutter uses OpenGL ES on Linux)
+      eglBindAPI(EGL_OPENGL_ES_API);
+
+      EGLint num_configs = 0;
+      EGLint config_id = 0;
+      if (flutter_context != EGL_NO_CONTEXT &&
+          eglQueryContext(self->egl_display, flutter_context, EGL_CONFIG_ID, &config_id)) {
+        EGLint config_attribs[] = { EGL_CONFIG_ID, config_id, EGL_NONE };
+        if (!eglChooseConfig(self->egl_display, config_attribs, &config, 1, &num_configs) || num_configs == 0) {
+          config = NULL;
+        }
+      }
+      if (config == NULL) {
+        EGLint config_attribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+            EGL_NONE,
+        };
+        if (!eglChooseConfig(self->egl_display, config_attribs, &config, 1, &num_configs) || num_configs == 0) {
+          config = NULL;
+        }
+      }
+
+      if (config != NULL) {        
+        // Create an isolated EGL context (NOT shared with Flutter)
+        // This prevents OpenGL state pollution and resource contention
+        EGLint context_attribs[] = {
+            EGL_CONTEXT_CLIENT_VERSION, 2,
+            EGL_NONE,
+        };
+        
+        self->egl_context = eglCreateContext(self->egl_display, config, 
+                                             EGL_NO_CONTEXT, context_attribs);
+        
+        if (self->egl_context != EGL_NO_CONTEXT) {
+          // A GLX context that GDK left current on this thread makes Mesa
+          // reject eglMakeCurrent with EGL_BAD_ACCESS.
+          if (flutter_context == EGL_NO_CONTEXT) {
+            gdk_gl_context_clear_current();
+          }
+          // Make our isolated context current for initialization (surfaceless)
+          if (eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
+            // Create texture with our isolated context
+            self->texture_gl = texture_gl_new(self);
+            
+            if (fl_texture_registrar_register_texture(
+                    texture_registrar, FL_TEXTURE(self->texture_gl))) {
+              // Initialize mpv with our isolated EGL context
+              mpv_opengl_init_params gl_init_params{
+                  [](auto, auto name) {
+                    return (void*)eglGetProcAddress(name);
+                  },
+                  NULL,
+              };
+              
+              mpv_render_param params[] = {
+                  {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
+                  {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, (void*)&gl_init_params},
+                  {MPV_RENDER_PARAM_INVALID, (void*)0},
+                  {MPV_RENDER_PARAM_INVALID, (void*)0},
+              };
+              
+              // VAAPI acceleration requires passing X11/Wayland display
+              GdkDisplay* display = gdk_display_get_default();
+              if (GDK_IS_WAYLAND_DISPLAY(display)) {
+                params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
+                params[2].data = gdk_wayland_display_get_wl_display(display);
+              } else if (GDK_IS_X11_DISPLAY(display)) {
+                params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
+                params[2].data = gdk_x11_display_get_xdisplay(display);
+              }
+              
+              if (mpv_render_context_create(&self->render_context, self->handle, params) == 0) {
+                mpv_render_context_set_update_callback(
+                    self->render_context,
+                    [](void* data) {
+                      VideoOutput* self = (VideoOutput*)data;
+                      if (self->destroyed) {
+                        return;
+                      }
+                      fl_texture_registrar_mark_texture_frame_available(
+                          self->texture_registrar, FL_TEXTURE(self->texture_gl));
+                    },
+                    self);
+                hardware_acceleration_supported = TRUE;
+                g_print("media_kit: VideoOutput: H/W rendering with isolated EGL context.\n");
+              } else {
+                g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context.\n");
+              }
+            } else {
+              g_printerr("media_kit: VideoOutput: Failed to register texture.\n");
+            }
+            
+            video_output_restore_egl(flutter_display, flutter_draw_surface,
+                                     flutter_read_surface, flutter_context,
+                                     self->egl_display);
+          } else {
+            g_printerr("media_kit: VideoOutput: Failed to make isolated EGL context current. Error: 0x%x\n", eglGetError());
+          }
+        } else {
+          g_printerr("media_kit: VideoOutput: Failed to create isolated EGL context. Error: 0x%x\n", eglGetError());
+        }
+      } else {
+        g_printerr("media_kit: VideoOutput: Could not obtain Flutter's EGL config.\n");
+      }
+    } else {
+      g_printerr("media_kit: VideoOutput: Could not get an EGL display.\n");
     }
   }
 #ifdef MPV_RENDER_API_TYPE_SW
@@ -227,62 +368,6 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
   }
 #endif
   return self;
-}
-
-void video_output_ensure_render_context(VideoOutput* self) {
-  if (self->render_context == NULL && !self->destroyed) {
-    g_print("media_kit: VideoOutput: ensure_render_context entered (rc=NULL)\n");
-  }
-  if (self->render_context != NULL || self->destroyed) {
-    return;
-  }
-  // Must be called on Flutter's raster thread with Flutter's GL context
-  // current (texture_gl_populate_texture guarantees this).
-  mpv_opengl_init_params gl_init_params{
-      [](auto, auto name) {
-        return (void*)eglGetProcAddress(name);
-      },
-      NULL,
-  };
-
-  mpv_render_param params[] = {
-      {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
-      {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, (void*)&gl_init_params},
-      {MPV_RENDER_PARAM_INVALID, (void*)0},
-      {MPV_RENDER_PARAM_INVALID, (void*)0},
-  };
-
-  // VAAPI acceleration requires passing X11/Wayland display.
-  GdkDisplay* display = gdk_display_get_default();
-  if (GDK_IS_WAYLAND_DISPLAY(display)) {
-    params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
-    params[2].data = gdk_wayland_display_get_wl_display(display);
-  } else if (GDK_IS_X11_DISPLAY(display)) {
-    params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
-    params[2].data = gdk_x11_display_get_xdisplay(display);
-  }
-
-  if (mpv_render_context_create(&self->render_context, self->handle,
-                                params) == 0) {
-    mpv_render_context_set_update_callback(
-        self->render_context,
-        [](void* data) {
-          VideoOutput* self = (VideoOutput*)data;
-          if (self->destroyed) {
-            return;
-          }
-          fl_texture_registrar_mark_texture_frame_available(
-              self->texture_registrar, FL_TEXTURE(self->texture_gl));
-        },
-        self);
-    g_print("media_kit: VideoOutput: mpv render context created on Flutter's raster thread.\n");
-    // Video may have been initialized before the render context existed
-    // (vo=libmpv makes video init fail in that case); reload the video
-    // track so the render pipeline attaches.
-    mpv_command_string(self->handle, "video-reload");
-  } else {
-    g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context on raster thread.\n");
-  }
 }
 
 void video_output_set_texture_update_callback(

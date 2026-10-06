@@ -90,13 +90,6 @@ void video_output_set_size(VideoOutput* self, gint64 width, gint64 height);
 
 mpv_render_context* video_output_get_render_context(VideoOutput* self);
 
-/**
- * @brief Creates the mpv render context if not yet created. Must be called
- * on Flutter's raster thread with Flutter's GL context current (i.e. from
- * |texture_gl_populate_texture|).
- */
-void video_output_ensure_render_context(VideoOutput* self);
-
 GdkGLContext* video_output_get_gdk_gl_context(VideoOutput* self);
 
 EGLDisplay video_output_get_egl_display(VideoOutput* self);
