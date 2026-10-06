@@ -15,6 +15,8 @@
 #include <gdk/gdkwayland.h>
 #include <gdk/gdkx.h>
 
+#include <string.h>
+
 struct _VideoOutput {
   GObject parent_instance;
   TextureGL* texture_gl;
@@ -166,106 +168,166 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
     if (egl_display != EGL_NO_DISPLAY && eglInitialize(egl_display, NULL, NULL)) {
       self->egl_display = egl_display;
 
-      eglBindAPI(EGL_OPENGL_ES_API);
+      // v3 diagnostics: identify EGL implementation & supported paths.
+      const char* vendor = eglQueryString(egl_display, EGL_VENDOR);
+      const char* client_apis = eglQueryString(egl_display, EGL_CLIENT_APIS);
+      const char* exts = eglQueryString(egl_display, EGL_EXTENSIONS);
+      gboolean has_surfaceless =
+          exts && strstr(exts, "EGL_KHR_surfaceless_context") != NULL;
+      g_print("media_kit: VideoOutput: EGL init v3. vendor: %s | client APIs: %s | surfaceless: %s\n",
+              vendor ? vendor : "?", client_apis ? client_apis : "?",
+              has_surfaceless ? "yes" : "no");
 
       // Pick our own config; Flutter's context is neither current nor
       // visible from this thread, so we cannot query its EGL_CONFIG_ID.
+      // Accept both GLES2 and desktop GL so the fallback chain below can
+      // try either client API.
       EGLConfig config = NULL;
       {
         EGLint num_configs = 0;
         const EGLint config_attribs[] = {
             EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RENDERABLE_TYPE, (EGL_OPENGL_ES2_BIT | EGL_OPENGL_BIT),
             EGL_NONE,
         };
         if (eglChooseConfig(egl_display, config_attribs, &config, 1,
                             &num_configs) && num_configs > 0) {
           g_print("media_kit: VideoOutput: Using own EGL config.\n");
         } else {
-          g_printerr("media_kit: VideoOutput: Failed to choose EGL config.\n");
-          config = NULL;
+          // Retry with only GLES2 (some stacks reject combined masks).
+          const EGLint es2_attribs[] = {
+              EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+              EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+              EGL_NONE,
+          };
+          if (eglChooseConfig(egl_display, es2_attribs, &config, 1,
+                              &num_configs) && num_configs > 0) {
+            g_print("media_kit: VideoOutput: Using own EGL config (ES2-only).\n");
+          } else {
+            g_printerr("media_kit: VideoOutput: Failed to choose EGL config.\n");
+            config = NULL;
+          }
         }
       }
 
       if (config != NULL) {
-        // Create an isolated EGL context (NOT shared with Flutter).
-        EGLint context_attribs[] = {
-            EGL_CONTEXT_CLIENT_VERSION, 2,
-            EGL_NONE,
+        // Create an isolated EGL context (NOT shared with Flutter) and make
+        // it current, trying several surface/API combinations: NVIDIA
+        // drivers reject surfaceless make-current (egl-wayland#48), and
+        // some fail on GLES contexts here as well.
+        struct {
+          const char* name;
+          EGLenum api;
+          gboolean surfaceless;
+          EGLint gles_version;  // 0 = desktop GL
+        } attempts[] = {
+            {"pbuffer + GLES2", EGL_OPENGL_ES_API, FALSE, 2},
+            {"pbuffer + desktop GL", EGL_OPENGL_API, FALSE, 0},
+            {"surfaceless + GLES2", EGL_OPENGL_ES_API, TRUE, 2},
+            {"surfaceless + desktop GL", EGL_OPENGL_API, TRUE, 0},
         };
+        gboolean context_ok = FALSE;
 
-        self->egl_context = eglCreateContext(egl_display, config,
-                                             EGL_NO_CONTEXT, context_attribs);
-
-        if (self->egl_context != EGL_NO_CONTEXT) {
-          // Surfaceless make-current is unreliable on NVIDIA
-          // (egl-wayland#48); bind a tiny pbuffer instead.
-          const EGLint pbuffer_attribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1,
-                                            EGL_NONE};
-          self->egl_surface =
-              eglCreatePbufferSurface(egl_display, config, pbuffer_attribs);
-          if (self->egl_surface == EGL_NO_SURFACE) {
-            g_printerr("media_kit: VideoOutput: Failed to create pbuffer surface. Error: 0x%x\n", eglGetError());
+        for (size_t i = 0;
+             i < sizeof(attempts) / sizeof(attempts[0]) && !context_ok; i++) {
+          if (attempts[i].surfaceless && !has_surfaceless) {
+            continue;
           }
-          if (self->egl_surface != EGL_NO_SURFACE &&
-              eglMakeCurrent(egl_display, self->egl_surface, self->egl_surface,
-                             self->egl_context)) {
-            self->texture_gl = texture_gl_new(self);
+          eglBindAPI(attempts[i].api);
+          EGLint gles_attribs[] = {EGL_CONTEXT_CLIENT_VERSION,
+                                   attempts[i].gles_version, EGL_NONE};
+          EGLint gl_attribs[] = {EGL_NONE};
+          EGLContext ctx = eglCreateContext(
+              egl_display, config, EGL_NO_CONTEXT,
+              attempts[i].gles_version ? gles_attribs : gl_attribs);
+          if (ctx == EGL_NO_CONTEXT) {
+            g_printerr("media_kit: VideoOutput: eglCreateContext failed (%s). Error: 0x%x\n",
+                       attempts[i].name, eglGetError());
+            continue;
+          }
 
-            if (fl_texture_registrar_register_texture(
-                    texture_registrar, FL_TEXTURE(self->texture_gl))) {
-              mpv_opengl_init_params gl_init_params{
-                  [](auto, auto name) {
-                    return (void*)eglGetProcAddress(name);
-                  },
-                  NULL,
-              };
+          EGLSurface surf = EGL_NO_SURFACE;
+          if (!attempts[i].surfaceless) {
+            const EGLint pbuffer_attribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1,
+                                              EGL_NONE};
+            surf = eglCreatePbufferSurface(egl_display, config,
+                                           pbuffer_attribs);
+            if (surf == EGL_NO_SURFACE) {
+              g_printerr("media_kit: VideoOutput: eglCreatePbufferSurface failed (%s). Error: 0x%x\n",
+                         attempts[i].name, eglGetError());
+              eglDestroyContext(egl_display, ctx);
+              continue;
+            }
+          }
 
-              mpv_render_param params[] = {
-                  {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
-                  {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, (void*)&gl_init_params},
-                  {MPV_RENDER_PARAM_INVALID, (void*)0},
-                  {MPV_RENDER_PARAM_INVALID, (void*)0},
-              };
+          if (eglMakeCurrent(egl_display, surf, surf, ctx)) {
+            self->egl_context = ctx;
+            self->egl_surface = surf;
+            context_ok = TRUE;
+            g_print("media_kit: VideoOutput: isolated context current via %s\n",
+                    attempts[i].name);
+          } else {
+            g_printerr("media_kit: VideoOutput: eglMakeCurrent failed (%s). Error: 0x%x\n",
+                       attempts[i].name, eglGetError());
+            if (surf != EGL_NO_SURFACE) {
+              eglDestroySurface(egl_display, surf);
+            }
+            eglDestroyContext(egl_display, ctx);
+          }
+        }
 
-              // VAAPI acceleration requires passing X11/Wayland display.
-              GdkDisplay* display = gdk_display_get_default();
-              if (GDK_IS_WAYLAND_DISPLAY(display)) {
-                params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
-                params[2].data = gdk_wayland_display_get_wl_display(display);
-              } else if (GDK_IS_X11_DISPLAY(display)) {
-                params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
-                params[2].data = gdk_x11_display_get_xdisplay(display);
-              }
+        if (context_ok) {
+          self->texture_gl = texture_gl_new(self);
 
-              if (mpv_render_context_create(&self->render_context, self->handle, params) == 0) {
-                mpv_render_context_set_update_callback(
-                    self->render_context,
-                    [](void* data) {
-                      VideoOutput* self = (VideoOutput*)data;
-                      if (self->destroyed) {
-                        return;
-                      }
-                      fl_texture_registrar_mark_texture_frame_available(
-                          self->texture_registrar, FL_TEXTURE(self->texture_gl));
-                    },
-                    self);
-                hardware_acceleration_supported = TRUE;
-                g_print("media_kit: VideoOutput: H/W rendering with isolated EGL context.\n");
-              } else {
-                g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context.\n");
-              }
-            } else {
-              g_printerr("media_kit: VideoOutput: Failed to register texture.\n");
+          if (fl_texture_registrar_register_texture(
+                  texture_registrar, FL_TEXTURE(self->texture_gl))) {
+            mpv_opengl_init_params gl_init_params{
+                [](auto, auto name) {
+                  return (void*)eglGetProcAddress(name);
+                },
+                NULL,
+            };
+
+            mpv_render_param params[] = {
+                {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
+                {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, (void*)&gl_init_params},
+                {MPV_RENDER_PARAM_INVALID, (void*)0},
+                {MPV_RENDER_PARAM_INVALID, (void*)0},
+            };
+
+            // VAAPI acceleration requires passing X11/Wayland display.
+            GdkDisplay* display = gdk_display_get_default();
+            if (GDK_IS_WAYLAND_DISPLAY(display)) {
+              params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
+              params[2].data = gdk_wayland_display_get_wl_display(display);
+            } else if (GDK_IS_X11_DISPLAY(display)) {
+              params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
+              params[2].data = gdk_x11_display_get_xdisplay(display);
             }
 
-            // Nothing else was current on this thread; just release ours.
-            eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            if (mpv_render_context_create(&self->render_context, self->handle, params) == 0) {
+              mpv_render_context_set_update_callback(
+                  self->render_context,
+                  [](void* data) {
+                    VideoOutput* self = (VideoOutput*)data;
+                    if (self->destroyed) {
+                      return;
+                    }
+                    fl_texture_registrar_mark_texture_frame_available(
+                        self->texture_registrar, FL_TEXTURE(self->texture_gl));
+                  },
+                  self);
+              hardware_acceleration_supported = TRUE;
+              g_print("media_kit: VideoOutput: H/W rendering with isolated EGL context.\n");
+            } else {
+              g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context.\n");
+            }
           } else {
-            g_printerr("media_kit: VideoOutput: Failed to make isolated EGL context current. Error: 0x%x\n", eglGetError());
+            g_printerr("media_kit: VideoOutput: Failed to register texture.\n");
           }
-        } else {
-          g_printerr("media_kit: VideoOutput: Failed to create isolated EGL context. Error: 0x%x\n", eglGetError());
+
+          // Nothing else was current on this thread; just release ours.
+          eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         }
       }
     } else {
