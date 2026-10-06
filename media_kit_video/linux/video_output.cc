@@ -35,6 +35,7 @@ struct _VideoOutput {
   gpointer texture_update_callback_context;
   FlTextureRegistrar* texture_registrar;
   gboolean destroyed;
+  guint poller_id; /* GLib source id of the render-context poller. */
 };
 
 G_DEFINE_TYPE(VideoOutput, video_output, G_TYPE_OBJECT)
@@ -42,6 +43,10 @@ G_DEFINE_TYPE(VideoOutput, video_output, G_TYPE_OBJECT)
 static void video_output_dispose(GObject* object) {
   VideoOutput* self = VIDEO_OUTPUT(object);
   self->destroyed = TRUE;
+  if (self->poller_id != 0) {
+    g_source_remove(self->poller_id);
+    self->poller_id = 0;
+  }
   
   // Make sure that no more callbacks are invoked from mpv.
   if (self->render_context) {
@@ -93,6 +98,7 @@ static void video_output_init(VideoOutput* self) {
   self->pixel_buffer = NULL;
   self->handle = NULL;
   self->render_context = NULL;
+  self->poller_id = 0;
   self->width = 0;
   self->height = 0;
   self->configuration = VideoOutputConfiguration{};
@@ -101,6 +107,22 @@ static void video_output_init(VideoOutput* self) {
   self->texture_registrar = NULL;
   self->destroyed = FALSE;
   g_mutex_init(&self->mutex);
+}
+
+static gboolean video_output_poll_texture(gpointer data) {
+  VideoOutput* self = VIDEO_OUTPUT(data);
+  if (self->destroyed) {
+    self->poller_id = 0;
+    return G_SOURCE_REMOVE;
+  }
+  if (self->render_context != NULL) {
+    // mpv's update callback drives the texture now.
+    self->poller_id = 0;
+    return G_SOURCE_REMOVE;
+  }
+  fl_texture_registrar_mark_texture_frame_available(
+      self->texture_registrar, FL_TEXTURE(self->texture_gl));
+  return G_SOURCE_CONTINUE;
 }
 
 VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
@@ -131,12 +153,20 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
     // is created lazily in texture_gl_populate_texture(), which runs on
     // Flutter's raster thread with Flutter's own GL context current, and
     // mpv renders directly into Flutter's texture.
+    // The render context is created later (on the raster thread); force
+    // mpv to wait for it instead of falling back to a windowed VO.
+    mpv_set_option_string(self->handle, "vo", "libmpv");
+
     self->texture_gl = texture_gl_new(self);
 
     if (fl_texture_registrar_register_texture(
             texture_registrar, FL_TEXTURE(self->texture_gl))) {
       hardware_acceleration_supported = TRUE;
-      g_print("media_kit: VideoOutput: H/W rendering via Flutter's raster context (v4).\n");
+      g_print("media_kit: VideoOutput: H/W rendering via Flutter's raster context (v5).\n");
+      // Kick the raster thread periodically until the render context exists
+      // (populate -> ensure_render_context); afterwards mpv's own update
+      // callback drives the texture and the poller removes itself.
+      self->poller_id = g_timeout_add(200, video_output_poll_texture, self);
     } else {
       g_printerr("media_kit: VideoOutput: Failed to register texture.\n");
       g_object_unref(self->texture_gl);
@@ -242,6 +272,10 @@ void video_output_ensure_render_context(VideoOutput* self) {
         },
         self);
     g_print("media_kit: VideoOutput: mpv render context created on Flutter's raster thread.\n");
+    // Video may have been initialized before the render context existed
+    // (vo=libmpv makes video init fail in that case); reload the video
+    // track so the render pipeline attaches.
+    mpv_command_string(self->handle, "video-reload");
   } else {
     g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context on raster thread.\n");
   }
