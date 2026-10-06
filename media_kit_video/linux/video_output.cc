@@ -117,6 +117,7 @@ static gboolean video_output_poll_texture(gpointer data) {
   }
   if (self->render_context != NULL) {
     // mpv's update callback drives the texture now.
+    g_print("media_kit: VideoOutput: poller stopped (render context ready)\n");
     self->poller_id = 0;
     return G_SOURCE_REMOVE;
   }
@@ -162,7 +163,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
     if (fl_texture_registrar_register_texture(
             texture_registrar, FL_TEXTURE(self->texture_gl))) {
       hardware_acceleration_supported = TRUE;
-      g_print("media_kit: VideoOutput: H/W rendering via Flutter's raster context (v6).\n");
+      g_print("media_kit: VideoOutput: H/W rendering via Flutter's raster context (v7).\n");
       // Kick the raster thread periodically until the render context exists
       // (populate -> ensure_render_context); afterwards mpv's own update
       // callback drives the texture and the poller removes itself.
@@ -229,6 +230,9 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
 }
 
 void video_output_ensure_render_context(VideoOutput* self) {
+  if (self->render_context == NULL && !self->destroyed) {
+    g_print("media_kit: VideoOutput: ensure_render_context entered (rc=NULL)\n");
+  }
   if (self->render_context != NULL || self->destroyed) {
     return;
   }

@@ -17,6 +17,7 @@ struct _TextureGL {
   guint32 fbo;               // FBO rendering into |name|
   guint32 current_width;
   guint32 current_height;
+  guint populate_calls; /* diagnostics */
   VideoOutput* video_output;
 };
 
