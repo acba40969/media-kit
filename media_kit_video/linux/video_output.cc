@@ -50,6 +50,10 @@ static void video_output_dispose(GObject* object) {
   if (self->texture_gl) {
     fl_texture_registrar_unregister_texture(self->texture_registrar,
                                             FL_TEXTURE(self->texture_gl));
+    // Dispose the texture first: it cleans up its GL resources with our
+    // isolated context, which still needs the pbuffer surface alive.
+    g_object_unref(self->texture_gl);
+    self->texture_gl = NULL;
     
     // Save Flutter's current context before cleanup
     EGLDisplay current_display = eglGetCurrentDisplay();
@@ -59,7 +63,10 @@ static void video_output_dispose(GObject* object) {
     
     // Free mpv_render_context with our own isolated EGL context
     if (self->render_context != NULL) {
-      if (self->egl_context != EGL_NO_CONTEXT) {
+      if (self->egl_context != EGL_NO_CONTEXT &&
+          self->egl_surface != EGL_NO_SURFACE) {
+        eglMakeCurrent(self->egl_display, self->egl_surface, self->egl_surface, self->egl_context);
+      } else if (self->egl_context != EGL_NO_CONTEXT) {
         eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context);
       }
       mpv_render_context_free(self->render_context);
@@ -76,8 +83,10 @@ static void video_output_dispose(GObject* object) {
       eglDestroyContext(self->egl_display, self->egl_context);
       self->egl_context = EGL_NO_CONTEXT;
     }
-    
-    g_object_unref(self->texture_gl);
+    if (self->egl_surface != EGL_NO_SURFACE) {
+      eglDestroySurface(self->egl_display, self->egl_surface);
+      self->egl_surface = EGL_NO_SURFACE;
+    }
   }
   // S/W
   if (self->texture_sw) {
@@ -165,6 +174,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
       {
         EGLint num_configs = 0;
         const EGLint config_attribs[] = {
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
             EGL_NONE,
         };
@@ -188,8 +198,18 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
                                              EGL_NO_CONTEXT, context_attribs);
 
         if (self->egl_context != EGL_NO_CONTEXT) {
-          // A surfaceless context is enough for the mpv render API.
-          if (eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, self->egl_context)) {
+          // Surfaceless make-current is unreliable on NVIDIA
+          // (egl-wayland#48); bind a tiny pbuffer instead.
+          const EGLint pbuffer_attribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1,
+                                            EGL_NONE};
+          self->egl_surface =
+              eglCreatePbufferSurface(egl_display, config, pbuffer_attribs);
+          if (self->egl_surface == EGL_NO_SURFACE) {
+            g_printerr("media_kit: VideoOutput: Failed to create pbuffer surface. Error: 0x%x\n", eglGetError());
+          }
+          if (self->egl_surface != EGL_NO_SURFACE &&
+              eglMakeCurrent(egl_display, self->egl_surface, self->egl_surface,
+                             self->egl_context)) {
             self->texture_gl = texture_gl_new(self);
 
             if (fl_texture_registrar_register_texture(

@@ -87,9 +87,10 @@ static void texture_gl_dispose(GObject* object) {
   if (video_output != NULL) {
     EGLDisplay egl_display = video_output_get_egl_display(video_output);
     EGLContext egl_context = video_output_get_egl_context(video_output);
-    
+    EGLSurface egl_surface = video_output_get_egl_surface(video_output);
+
     if (egl_context != EGL_NO_CONTEXT) {
-      eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context);
+      eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
       
       if (self->mpv_texture != 0) {
         glDeleteTextures(1, &self->mpv_texture);
@@ -149,9 +150,10 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
       
       EGLDisplay egl_display = video_output_get_egl_display(video_output);
       EGLContext egl_context = video_output_get_egl_context(video_output);
-      
+      EGLSurface egl_surface = video_output_get_egl_surface(video_output);
+
       // Switch to mpv's isolated context to create/resize mpv's texture and FBO
-      eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context);
+      eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
       
       // Free previous resources in mpv's context
       if (!first_frame) {
@@ -229,10 +231,11 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
     
     EGLDisplay egl_display = video_output_get_egl_display(video_output);
     EGLContext egl_context = video_output_get_egl_context(video_output);
+    EGLSurface egl_surface = video_output_get_egl_surface(video_output);
     mpv_render_context* render_context = video_output_get_render_context(video_output);
-    
+
     // Switch to mpv's isolated context for rendering
-    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context);
+    eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context);
     
     // Bind mpv's FBO
     glBindFramebuffer(GL_FRAMEBUFFER, self->fbo);
