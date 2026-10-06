@@ -48,14 +48,24 @@ static void video_output_dispose(GObject* object) {
 
   // H/W
   if (self->texture_gl) {
-    fl_texture_registrar_unregister_texture(self->texture_registrar,
-                                            FL_TEXTURE(self->texture_gl));
-    
     // Save Flutter's current context before cleanup
     EGLDisplay current_display = eglGetCurrentDisplay();
     EGLContext flutter_context = eglGetCurrentContext();
     EGLSurface flutter_draw_surface = eglGetCurrentSurface(EGL_DRAW);
     EGLSurface flutter_read_surface = eglGetCurrentSurface(EGL_READ);
+
+    // A GLX context left current by GDK on this thread makes eglMakeCurrent
+    // fail with EGL_BAD_ACCESS; clear it so the texture dispose and
+    // mpv_render_context_free() below actually run with our isolated
+    // context current, and restore it when done.
+    GdkGLContext* saved_gdk_context = NULL;
+    if (flutter_context == EGL_NO_CONTEXT && self->egl_context != EGL_NO_CONTEXT) {
+      saved_gdk_context = gdk_gl_context_get_current();
+      gdk_gl_context_clear_current();
+    }
+
+    fl_texture_registrar_unregister_texture(self->texture_registrar,
+                                            FL_TEXTURE(self->texture_gl));
     
     // Free mpv_render_context with our own isolated EGL context
     if (self->render_context != NULL) {
@@ -71,6 +81,10 @@ static void video_output_dispose(GObject* object) {
       } else if (self->egl_display != EGL_NO_DISPLAY) {
         eglMakeCurrent(self->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
       }
+    }
+
+    if (saved_gdk_context != NULL) {
+      gdk_gl_context_make_current(saved_gdk_context);
     }
     
     // Clean up EGL resources
@@ -198,6 +212,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
     
     self->egl_display = EGL_NO_DISPLAY;
     EGLConfig config = NULL;
+    GdkGLContext* saved_gdk_context = NULL;
     if (flutter_display != EGL_NO_DISPLAY && flutter_context != EGL_NO_CONTEXT) {
       self->egl_display = flutter_display;
     } else {
@@ -242,8 +257,10 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
         
         if (self->egl_context != EGL_NO_CONTEXT) {
           // A GLX context that GDK left current on this thread makes Mesa
-          // reject eglMakeCurrent with EGL_BAD_ACCESS.
+          // reject eglMakeCurrent with EGL_BAD_ACCESS. Clear it, but save it
+          // first so the thread's GL state is restored afterwards.
           if (flutter_context == EGL_NO_CONTEXT) {
+            saved_gdk_context = gdk_gl_context_get_current();
             gdk_gl_context_clear_current();
           }
           // Make our isolated context current for initialization (surfaceless)
@@ -291,7 +308,7 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
                     },
                     self);
                 hardware_acceleration_supported = TRUE;
-                g_print("media_kit: VideoOutput: H/W rendering with isolated EGL context.\n");
+                g_print("media_kit: VideoOutput: H/W rendering with isolated EGL context (v8).\n");
               } else {
                 g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context.\n");
               }
@@ -310,6 +327,10 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
         }
       } else {
         g_printerr("media_kit: VideoOutput: Could not obtain Flutter's EGL config.\n");
+      }
+      if (saved_gdk_context != NULL) {
+        // Hand the thread's original GL context back to GDK/Flutter.
+        gdk_gl_context_make_current(saved_gdk_context);
       }
     } else {
       g_printerr("media_kit: VideoOutput: Could not get an EGL display.\n");
